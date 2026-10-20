@@ -1,64 +1,43 @@
 # MPP — Mini Payment Platform
 
-Payment platform backend built to show what fintech interviewers actually probe: double-entry correctness, idempotency, concurrency safety, async eventing, and reconciliation — not UI.
+This is a payment platform backend, built with Kotlin + Spring Boot. Here's how it's structured and where it's headed.
 
-Stack: **Kotlin + Spring Boot**, PostgreSQL, Kafka, Testcontainers, Docker Compose.
+## The core idea
 
-## Why this project
+At the bottom of everything is a **double-entry ledger**. Every account, every transaction, every debit/credit entry — they always have to balance to zero. Amounts are stored as `BigDecimal` or integer minor units (cents), never `Double` — money math with floats is how you get bugs that cost real money. Entries are append-only and immutable; balances are always derived from the ledger, never stored and mutated directly.
 
-Companies like Revolut, Satispay, PayPal don't hire for frontend. They hire for people who understand ledgers, idempotency, consistency under concurrency, and failure handling. This repo exists to prove that, with design decisions documented (see ADRs below) rather than just code.
+On top of that sits a **payment API**. `POST /payments` takes an `Idempotency-Key` header, so firing the same request twice never charges twice. Payments move through a state machine: `CREATED → AUTHORIZED → CAPTURED → SETTLED`, with `FAILED`, `REFUNDED`, `CANCELLED` as side states. Refunds can be partial or full.
 
-## Modules (in order of build, increasing difficulty)
+Once that's solid, the next layer is **concurrency**. Two transfers hitting the same account at the same time shouldn't corrupt a balance or double-spend — that's handled with DB transactions and optimistic/pessimistic locking, leaning on Kotlin coroutines for the concurrent paths.
 
-### 1. Double-entry ledger (core)
-- Accounts, transactions, debit/credit entries that always balance to zero
-- Amounts as `BigDecimal` or integer minor units (cents) — never `Double`
-- Balances derived from the ledger; entries are immutable/append-only
+After that comes **async integration**: a transactional outbox pattern feeding Kafka, publishing events like `PaymentCaptured`. Outbound webhooks go out to merchants with retry and exponential backoff. There's a separate consumer that simulates an external acquirer/PSP, so the whole flow can be tested end to end without a real payment network.
 
-### 2. Payment API with idempotency
-- `POST /payments` with `Idempotency-Key` header — same request never double-charges
-- Payment state machine: `CREATED → AUTHORIZED → CAPTURED → SETTLED`, plus `FAILED`, `REFUNDED`, `CANCELLED`
-- Partial and full refunds
+Last piece is **reconciliation and anti-fraud**: a batch job that reconciles the ledger against a simulated settlement CSV, plus basic fraud/velocity rules (e.g. max N payments in X minutes).
 
-### 3. Concurrency and consistency
-- DB transactions, optimistic/pessimistic locking, handling two simultaneous transfers on the same account
-- Kotlin coroutines for concurrent paths
+## Stack
 
-### 4. Async events and integration
-- Transactional outbox pattern + Kafka for events like `PaymentCaptured`
-- Outbound webhooks to merchants with retry + exponential backoff
-- Separate consumer simulating an external acquirer/PSP
+- Kotlin + Spring Boot
+- PostgreSQL, with Exposed/jOOQ and Flyway migrations
+- Kafka for events
+- Testcontainers + Kotest/JUnit for integration tests
+- Docker Compose to run it all locally
+- OpenAPI/Swagger for the API docs
+- Prometheus + Grafana for observability
 
-### 5. Reconciliation and anti-fraud (advanced)
-- Batch job reconciling ledger against a simulated settlement CSV
-- Simple fraud/velocity rules (e.g. max N payments in X minutes)
+## Build order
 
-## Stack details
+1. Ledger + base API + tests
+2. State machine, idempotency, refunds
+3. Kafka + outbox + webhooks
+4. Reconciliation, fraud rules, observability
 
-| Concern | Choice |
-|---|---|
-| Language/framework | Kotlin + Spring Boot |
-| Persistence | PostgreSQL + Exposed/jOOQ, Flyway migrations |
-| Messaging | Kafka |
-| Testing | Testcontainers + Kotest/JUnit (integration tests) |
-| Local env | Docker Compose |
-| API docs | OpenAPI/Swagger |
-| Observability | Prometheus + Grafana |
+## Worth studying alongside this
 
-## Roadmap
-
-- **1** : ledger + base API + tests
-- **2** : state machine, idempotency, refunds
-- **3** : Kafka + outbox + webhooks
-- **4** : reconciliation, fraud rules, observability
-
-## Domain study (parallel, not blocking)
-
-To go deeper than the simulated flows: ISO 20022, card flows (auth/capture/clearing/settlement), SEPA/SEPA Instant, PSD2/SCA.
+ISO 20022, real card flows (auth/capture/clearing/settlement), SEPA/SEPA Instant, PSD2/SCA — even simulated versions of these in the project show the domain is understood, not just the code.
 
 ## ADRs
 
-Architecture Decision Records live in `docs/adr/` (to be added) — why outbox over direct publish, why minor units over decimals, how retries are handled, etc.
+Design decisions (why outbox instead of publishing directly, why minor units instead of decimals, how retries work) will live in `docs/adr/`.
 
 ## Run
 
@@ -71,5 +50,3 @@ Architecture Decision Records live in `docs/adr/` (to be added) — why outbox o
 ```
 ./gradlew test
 ```
-
-Concurrency tests should demonstrate the system neither loses nor duplicates money.
