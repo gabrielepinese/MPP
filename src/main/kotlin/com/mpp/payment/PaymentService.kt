@@ -1,5 +1,6 @@
 package com.mpp.payment
 
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.time.Instant
 import java.util.UUID
@@ -7,6 +8,8 @@ import java.util.concurrent.ConcurrentHashMap
 
 @Service
 class PaymentService {
+
+    private val logger = LoggerFactory.getLogger(PaymentService::class.java)
 
     // Placeholder store until the ledger-backed repository lands.
     private val paymentsById = ConcurrentHashMap<UUID, Payment>()
@@ -49,10 +52,11 @@ class PaymentService {
             val totalRefunded = payment.refundedAmountMinorUnits + refundAmount
 
             if (refundAmount <= 0 || totalRefunded > payment.amountMinorUnits) {
-                throw InvalidRefundAmountException(
-                    "Refund amount $refundAmount is invalid for payment ${payment.id} " +
-                        "(already refunded ${payment.refundedAmountMinorUnits} of ${payment.amountMinorUnits})"
+                logger.warn(
+                    "Rejected refund of {} for payment {} (already refunded {} of {})",
+                    refundAmount, payment.id, payment.refundedAmountMinorUnits, payment.amountMinorUnits
                 )
+                throw InvalidRefundAmountException("Refund amount is invalid for this payment")
             }
 
             val newStatus = if (totalRefunded == payment.amountMinorUnits) PaymentStatus.REFUNDED else payment.status
