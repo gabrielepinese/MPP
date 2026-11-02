@@ -9,12 +9,11 @@ import java.util.concurrent.ConcurrentHashMap
 class PaymentService {
 
     // Placeholder store until the ledger-backed repository lands.
-    private val paymentsByIdempotencyKey = ConcurrentHashMap<String, Payment>()
+    private val paymentsById = ConcurrentHashMap<UUID, Payment>()
+    private val idByIdempotencyKey = ConcurrentHashMap<String, UUID>()
 
     fun create(idempotencyKey: String, request: CreatePaymentRequest): Payment {
-        paymentsByIdempotencyKey[idempotencyKey]?.let { return it }
-
-        val payment = Payment(
+        val candidate = Payment(
             id = UUID.randomUUID(),
             idempotencyKey = idempotencyKey,
             amountMinorUnits = request.amountMinorUnits,
@@ -23,12 +22,51 @@ class PaymentService {
             createdAt = Instant.now()
         )
 
-        // Not atomic yet: a race on the same key can create two payments
-        // until this is backed by a DB unique constraint on idempotency_key.
-        paymentsByIdempotencyKey.putIfAbsent(idempotencyKey, payment)
-        return paymentsByIdempotencyKey[idempotencyKey]!!
+        // Published into paymentsById before the key mapping becomes visible,
+        // so no caller can observe a key that doesn't resolve to a stored payment yet.
+        val winningId = idByIdempotencyKey.computeIfAbsent(idempotencyKey) {
+            paymentsById[candidate.id] = candidate
+            candidate.id
+        }
+        return paymentsById[winningId]!!
     }
 
-    fun findById(id: UUID): Payment? =
-        paymentsByIdempotencyKey.values.find { it.id == id }
+    fun findById(id: UUID): Payment =
+        paymentsById[id] ?: throw PaymentNotFoundException(id)
+
+    fun authorize(id: UUID): Payment = transition(id, PaymentStatus.AUTHORIZED)
+    fun capture(id: UUID): Payment = transition(id, PaymentStatus.CAPTURED)
+    fun settle(id: UUID): Payment = transition(id, PaymentStatus.SETTLED)
+    fun cancel(id: UUID): Payment = transition(id, PaymentStatus.CANCELLED)
+    fun fail(id: UUID): Payment = transition(id, PaymentStatus.FAILED)
+
+    fun refund(id: UUID, amountMinorUnits: Long?): Payment {
+        val updated = paymentsById.compute(id) { _, current ->
+            val payment = current ?: throw PaymentNotFoundException(id)
+            PaymentStateMachine.assertCanRefund(payment.status)
+
+            val refundAmount = amountMinorUnits ?: (payment.amountMinorUnits - payment.refundedAmountMinorUnits)
+            val totalRefunded = payment.refundedAmountMinorUnits + refundAmount
+
+            if (refundAmount <= 0 || totalRefunded > payment.amountMinorUnits) {
+                throw InvalidRefundAmountException(
+                    "Refund amount $refundAmount is invalid for payment ${payment.id} " +
+                        "(already refunded ${payment.refundedAmountMinorUnits} of ${payment.amountMinorUnits})"
+                )
+            }
+
+            val newStatus = if (totalRefunded == payment.amountMinorUnits) PaymentStatus.REFUNDED else payment.status
+            payment.copy(refundedAmountMinorUnits = totalRefunded, status = newStatus)
+        }
+        return updated ?: throw PaymentNotFoundException(id)
+    }
+
+    private fun transition(id: UUID, to: PaymentStatus): Payment {
+        val updated = paymentsById.compute(id) { _, current ->
+            val payment = current ?: throw PaymentNotFoundException(id)
+            PaymentStateMachine.assertTransition(payment.status, to)
+            payment.copy(status = to)
+        }
+        return updated ?: throw PaymentNotFoundException(id)
+    }
 }

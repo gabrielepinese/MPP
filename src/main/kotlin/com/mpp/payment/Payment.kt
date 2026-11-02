@@ -19,5 +19,6 @@ data class Payment(
     val amountMinorUnits: Long,
     val currency: String,
     val status: PaymentStatus,
+    val refundedAmountMinorUnits: Long = 0,
     val createdAt: Instant
 )
