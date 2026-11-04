@@ -1,22 +1,30 @@
 package com.mpp.payment
 
+import com.mpp.outbox.OutboxEvent
+import com.mpp.outbox.OutboxRepository
+import org.jetbrains.exposed.exceptions.ExposedSQLException
+import org.jetbrains.exposed.sql.insert
+import org.jetbrains.exposed.sql.selectAll
+import org.jetbrains.exposed.sql.transactions.transaction
+import org.jetbrains.exposed.sql.update
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
+import tools.jackson.databind.ObjectMapper
 import java.time.Instant
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 
 @Service
-class PaymentService {
+class PaymentService(
+    private val outboxRepository: OutboxRepository,
+    private val objectMapper: ObjectMapper
+) {
 
     private val logger = LoggerFactory.getLogger(PaymentService::class.java)
 
-    // Placeholder store until the ledger-backed repository lands.
-    private val paymentsById = ConcurrentHashMap<UUID, Payment>()
-    private val idByIdempotencyKey = ConcurrentHashMap<String, UUID>()
-
     fun create(idempotencyKey: String, request: CreatePaymentRequest): Payment {
-        val candidate = Payment(
+        findByIdempotencyKey(idempotencyKey)?.let { return it }
+
+        val payment = Payment(
             id = UUID.randomUUID(),
             idempotencyKey = idempotencyKey,
             amountMinorUnits = request.amountMinorUnits,
@@ -25,52 +33,94 @@ class PaymentService {
             createdAt = Instant.now()
         )
 
-        // Published into paymentsById before the key mapping becomes visible,
-        // so no caller can observe a key that doesn't resolve to a stored payment yet.
-        val winningId = idByIdempotencyKey.computeIfAbsent(idempotencyKey) {
-            paymentsById[candidate.id] = candidate
-            candidate.id
-        }
-        return paymentsById[winningId]!!
-    }
-
-    fun findById(id: UUID): Payment =
-        paymentsById[id] ?: throw PaymentNotFoundException(id)
-
-    fun authorize(id: UUID): Payment = transition(id, PaymentStatus.AUTHORIZED)
-    fun capture(id: UUID): Payment = transition(id, PaymentStatus.CAPTURED)
-    fun settle(id: UUID): Payment = transition(id, PaymentStatus.SETTLED)
-    fun cancel(id: UUID): Payment = transition(id, PaymentStatus.CANCELLED)
-    fun fail(id: UUID): Payment = transition(id, PaymentStatus.FAILED)
-
-    fun refund(id: UUID, amountMinorUnits: Long?): Payment {
-        val updated = paymentsById.compute(id) { _, current ->
-            val payment = current ?: throw PaymentNotFoundException(id)
-            PaymentStateMachine.assertCanRefund(payment.status)
-
-            val refundAmount = amountMinorUnits ?: (payment.amountMinorUnits - payment.refundedAmountMinorUnits)
-            val totalRefunded = payment.refundedAmountMinorUnits + refundAmount
-
-            if (refundAmount <= 0 || totalRefunded > payment.amountMinorUnits) {
-                logger.warn(
-                    "Rejected refund of {} for payment {} (already refunded {} of {})",
-                    refundAmount, payment.id, payment.refundedAmountMinorUnits, payment.amountMinorUnits
-                )
-                throw InvalidRefundAmountException("Refund amount is invalid for this payment")
+        return try {
+            transaction {
+                PaymentsTable.insert {
+                    it[id] = payment.id
+                    it[PaymentsTable.idempotencyKey] = payment.idempotencyKey
+                    it[amountMinorUnits] = payment.amountMinorUnits
+                    it[currency] = payment.currency
+                    it[status] = payment.status.name
+                    it[refundedAmountMinorUnits] = payment.refundedAmountMinorUnits
+                    it[createdAt] = payment.createdAt
+                }
+                outboxRepository.insert(eventFor(payment, "PaymentCreated"))
             }
-
-            val newStatus = if (totalRefunded == payment.amountMinorUnits) PaymentStatus.REFUNDED else payment.status
-            payment.copy(refundedAmountMinorUnits = totalRefunded, status = newStatus)
+            payment
+        } catch (ex: ExposedSQLException) {
+            // Unique constraint race on idempotency_key: another request won, return its payment.
+            findByIdempotencyKey(idempotencyKey) ?: throw ex
         }
-        return updated ?: throw PaymentNotFoundException(id)
     }
 
-    private fun transition(id: UUID, to: PaymentStatus): Payment {
-        val updated = paymentsById.compute(id) { _, current ->
-            val payment = current ?: throw PaymentNotFoundException(id)
-            PaymentStateMachine.assertTransition(payment.status, to)
-            payment.copy(status = to)
+    fun findById(id: UUID): Payment = transaction {
+        PaymentsTable.selectAll().where { PaymentsTable.id eq id }
+            .map { it.toPayment() }
+            .singleOrNull()
+    } ?: throw PaymentNotFoundException(id)
+
+    fun authorize(id: UUID): Payment = transition(id, PaymentStatus.AUTHORIZED, "PaymentAuthorized")
+    fun capture(id: UUID): Payment = transition(id, PaymentStatus.CAPTURED, "PaymentCaptured")
+    fun settle(id: UUID): Payment = transition(id, PaymentStatus.SETTLED, "PaymentSettled")
+    fun cancel(id: UUID): Payment = transition(id, PaymentStatus.CANCELLED, "PaymentCancelled")
+    fun fail(id: UUID): Payment = transition(id, PaymentStatus.FAILED, "PaymentFailed")
+
+    fun refund(id: UUID, amountMinorUnits: Long?): Payment = transaction {
+        val payment = PaymentsTable.selectAll().where { PaymentsTable.id eq id }
+            .forUpdate()
+            .map { it.toPayment() }
+            .singleOrNull() ?: throw PaymentNotFoundException(id)
+
+        PaymentStateMachine.assertCanRefund(payment.status)
+
+        val refundAmount = amountMinorUnits ?: (payment.amountMinorUnits - payment.refundedAmountMinorUnits)
+        val totalRefunded = payment.refundedAmountMinorUnits + refundAmount
+
+        if (refundAmount <= 0 || totalRefunded > payment.amountMinorUnits) {
+            logger.warn(
+                "Rejected refund of {} for payment {} (already refunded {} of {})",
+                refundAmount, payment.id, payment.refundedAmountMinorUnits, payment.amountMinorUnits
+            )
+            throw InvalidRefundAmountException("Refund amount is invalid for this payment")
         }
-        return updated ?: throw PaymentNotFoundException(id)
+
+        val newStatus = if (totalRefunded == payment.amountMinorUnits) PaymentStatus.REFUNDED else payment.status
+        val updated = payment.copy(refundedAmountMinorUnits = totalRefunded, status = newStatus)
+
+        PaymentsTable.update({ PaymentsTable.id eq id }) {
+            it[status] = updated.status.name
+            it[refundedAmountMinorUnits] = updated.refundedAmountMinorUnits
+        }
+        outboxRepository.insert(eventFor(updated, "PaymentRefunded"))
+        updated
     }
+
+    private fun transition(id: UUID, to: PaymentStatus, eventType: String): Payment = transaction {
+        val payment = PaymentsTable.selectAll().where { PaymentsTable.id eq id }
+            .forUpdate()
+            .map { it.toPayment() }
+            .singleOrNull() ?: throw PaymentNotFoundException(id)
+
+        PaymentStateMachine.assertTransition(payment.status, to)
+        val updated = payment.copy(status = to)
+
+        PaymentsTable.update({ PaymentsTable.id eq id }) {
+            it[status] = to.name
+        }
+        outboxRepository.insert(eventFor(updated, eventType))
+        updated
+    }
+
+    private fun findByIdempotencyKey(key: String): Payment? = transaction {
+        PaymentsTable.selectAll().where { PaymentsTable.idempotencyKey eq key }
+            .map { it.toPayment() }
+            .singleOrNull()
+    }
+
+    private fun eventFor(payment: Payment, eventType: String) = OutboxEvent(
+        aggregateType = "Payment",
+        aggregateId = payment.id,
+        eventType = eventType,
+        payload = objectMapper.writeValueAsString(PaymentResponse.from(payment))
+    )
 }
